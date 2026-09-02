@@ -1,0 +1,11 @@
+# Core: transcript extraction
+youtube-transcript-api>=0.6.2
+yt-dlp>=2024.8.6
+
+# Optional: richer summarisation with an LLM (install any you plan to use)
+# openai>=1.30.0
+# anthropic>=0.34.0
+# google-generativeai>=0.7.0
+
+# Optional: fully local audio transcription (heavy; needs ffmpeg and torch)
+# openai-whisper>=20231117
