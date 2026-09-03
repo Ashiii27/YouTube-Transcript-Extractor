@@ -6,7 +6,6 @@ Run with:
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +19,7 @@ from .core.transcript import (
     DEFAULT_LANGUAGES,
     Transcript,
     extract_transcript,
+    gemini_available,
     summarize_transcript,
 )
 
@@ -52,8 +52,12 @@ def root() -> Dict[str, str]:
 
 
 @app.get("/api/health", tags=["health"])
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "gemini_available": gemini_available(),
+        "ai_provider": "Google Gemini" if gemini_available() else None,
+    }
 
 
 def _resolve_languages(request: ExtractRequest) -> Optional[List[str]]:
@@ -92,7 +96,7 @@ def _segments(transcript: Transcript) -> List[SegmentSchema]:
 
 def _run_extract_and_summarize(
     params: Dict[str, Any],
-) -> Tuple[Transcript, Any, str]:
+) -> Tuple[Transcript, Any, str, List[str]]:
     extraction_keys = (
         "url",
         "input_path",
@@ -105,7 +109,7 @@ def _run_extract_and_summarize(
     transcript = extract_transcript(**extraction_params)
     if not transcript.segments:
         raise ValueError("No transcript content was extracted.")
-    summary, method = summarize_transcript(
+    summary, method, warnings = summarize_transcript(
         transcript,
         refine=bool(params.get("refine", False)),
         mode=str(params.get("summary_mode", "auto")),
@@ -113,7 +117,7 @@ def _run_extract_and_summarize(
         language=str(params.get("summary_language", "English")),
         max_sentences=int(params.get("max_sentences", 6)),
     )
-    return transcript, summary, method
+    return transcript, summary, method, warnings
 
 
 def _build_response(
@@ -135,10 +139,12 @@ def _build_response(
 
 async def _extract_task(params: Dict[str, Any]) -> ExtractResponse:
     try:
-        transcript, summary, method = await run_in_threadpool(
+        transcript, summary, method, warnings = await run_in_threadpool(
             _run_extract_and_summarize, params
         )
-        return _build_response(transcript, summary, method)
+        return _build_response(transcript, summary, method, warnings)
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

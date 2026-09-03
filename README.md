@@ -13,7 +13,14 @@ items, stats).
 | Backend API | **FastAPI** (`app/`) |
 | Frontend | **Next.js 14 / React** (`frontend/`) |
 | Transcript engine | Python CLI + `youtube-transcript-api` + `yt-dlp` |
-| Summarization | Built-in extractive (no keys) or OpenAI / Anthropic / Gemini LLM |
+| AI summarization | **Google Gemini** (`google-genai`) — the only cloud AI used |
+| Offline fallback | Built-in extractive summarizer (no key) + optional local Whisper |
+
+> All cloud AI features (summaries, refined reports, and cloud audio
+> transcription) use **Google models only** via the Gemini API. Set
+> `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) to enable them; without a key the app
+> still works fully offline using the extractive summarizer and optional local
+> Whisper.
 
 The original CLI still works exactly as before.
 
@@ -27,15 +34,15 @@ The original CLI still works exactly as before.
   Facebook, TED, Rumble, and many other sources.
 - **Transcription fallback**: when a video has no subtitles, downloads the best
   audio and transcribes it with:
-  - local OpenAI Whisper (free, offline),
-  - or the OpenAI `whisper-1` API if `OPENAI_API_KEY` is set.
+  - local open-source Whisper (free, fully offline),
+  - or **Google Gemini** in the cloud when `GEMINI_API_KEY` is set.
 - **Local files**: transcribe or parse local `.mp4`, `.m4a`, `.mp3`, `.wav`,
   `.vtt`, `.srt`, or `.txt` files.
 - **Web UI**: paste a URL or drop a file, choose summary mode and language,
   get a refined summary with tabs for the full transcript.
 - **Summarisation**:
   - `extractive` — built-in frequency-based summarizer, no keys required.
-  - `llm` — OpenAI, Anthropic, or Gemini summarization when a key is set.
+  - `llm` — Google Gemini AI summarization when `GEMINI_API_KEY` is set.
   - `auto` — uses an LLM when available, otherwise extractive.
 - **Refined output**: structured report with `overview`, `summary`,
   `key_points`, `highlights`, `action_items`, and `stats`.
@@ -117,7 +124,7 @@ API docs are available at **http://localhost:8000/docs**.
 2. Choose **Summary mode**:
    - `Auto` (LLM if a key is set, otherwise extractive)
    - `Local extractive` (no keys needed)
-   - `LLM` (requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`)
+   - `Google Gemini` (requires `GEMINI_API_KEY`; the only cloud AI used)
 3. Enable **Refined summary** for a structured report.
 4. Click **Extract & summarize**.
 5. Switch between **Summary** and **Transcript** tabs.
@@ -141,8 +148,8 @@ python extract_transcript.py "https://vimeo.com/123456789" --refine
 # Local file
 python extract_transcript.py ./meeting.m4a --platform file --refine
 
-# LLM-powered summary
-OPENAI_API_KEY=sk-... python extract_transcript.py "https://youtu.be/VIDEO_ID" --summary-mode llm --refine
+# Google Gemini AI summary
+GEMINI_API_KEY=AIza... python extract_transcript.py "https://youtu.be/VIDEO_ID" --summary-mode llm --refine
 ```
 
 ---
@@ -170,7 +177,11 @@ summary options as extra fields.
 
 ### `GET /api/health`
 
-Simple liveness check.
+Liveness check plus AI status:
+
+```json
+{ "status": "ok", "gemini_available": true, "ai_provider": "Google Gemini" }
+```
 
 ### `GET /`
 
@@ -212,13 +223,16 @@ Service metadata.
 
 ## Optional extras
 
-LLM-powered summaries (pick at least one):
+AI summaries & cloud transcription use **Google Gemini** via the official SDK
+(already in `requirements.txt`):
 
 ```bash
-pip install openai          # or
-pip install anthropic       # or
-pip install google-generativeai
+pip install google-genai
+export GEMINI_API_KEY=AIza...        # get a key from Google AI Studio
 ```
+
+Long videos are handled automatically: the transcript is summarised in chunks
+(map-reduce) so Gemini's context window is never exceeded.
 
 Fully local transcription (heavy; also needs ffmpeg on PATH):
 
@@ -237,8 +251,9 @@ audio for transcription.
   tool falls back to `yt-dlp` and then to audio transcription.
 - **Audio transcription needs `ffmpeg`** — Install ffmpeg and make sure it is on
   your `PATH` (e.g. `sudo apt install ffmpeg` on Debian/Ubuntu).
-- **`--summary-mode llm` says no provider configured** — Set `OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`.
+- **`--summary-mode llm` says Google Gemini is not configured** — Set
+  `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) to a key from Google AI Studio and
+  `pip install google-genai`. Without it, use `auto`/`extractive` mode.
 - **`/api` calls fail from the browser** — Make sure the FastAPI backend is
   running on port `8000` and the Next.js frontend on port `3000`.
 
@@ -249,5 +264,6 @@ audio for transcription.
 - This tool is for personal, educational, and fair-use analytics. Respect the
   terms of service of the video platform and the copyright of the content you
   summarise.
-- The local Whisper path is computationally heavy and is optional; the OpenAI
-  `whisper-1` API path is lighter if you already have an API key.
+- The local Whisper path is computationally heavy and is optional. Without it
+  (and without subtitles), audio is transcribed by Google Gemini in the cloud,
+  which needs `GEMINI_API_KEY`.
