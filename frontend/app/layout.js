@@ -1,9 +1,9 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Transcript Extractor",
+  title: "TranscriptIQ — AI Video Transcripts & Summaries",
   description:
-    "Extract transcripts from YouTube or any video platform and get refined summaries.",
+    "Extract transcripts from YouTube or any video platform and get polished, AI-crafted summaries powered by Google Gemini.",
 };
 
 export default function RootLayout({ children }) {

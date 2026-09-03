@@ -16,9 +16,11 @@ What it does
                              Whisper install or the OpenAI ``whisper-1`` API.
 3.  Local files           -> passes a local audio/video/subtitle file through
                              the same pipeline.
-4.  Summarisation         -> uses an LLM when an API key is present, otherwise
+4.  Summarisation         -> uses Google Gemini (the only cloud AI used by this
+                             project) when GEMINI_API_KEY is present, otherwise
                              falls back to a built-in extractive summarizer so
-                             the tool always works out of the box.
+                             the tool always works out of the box. Long videos
+                             are summarised in chunks (map-reduce).
 
 Examples
 --------
@@ -28,18 +30,18 @@ Examples
     # Structured, polished summary
     python extract_transcript.py "https://youtu.be/VIDEO_ID" --refine
 
-    # Use an LLM summary and save markdown/JSON
-    OPENAI_API_KEY=sk-... python extract_transcript.py \
+    # Use a Google Gemini AI summary and save markdown/JSON
+    GEMINI_API_KEY=AIza... python extract_transcript.py \
         https://youtu.be/VIDEO_ID --refine --summary-mode llm --save out.md
 
     # Any other platform (e.g. Vimeo/Facebook/TED) via yt-dlp
     python extract_transcript.py "https://vimeo.com/..." --refine
 
-    # Transcribe a local file (uses local whisper or OpenAI API for audio)
+    # Transcribe a local file (local Whisper offline, or Gemini in the cloud)
     python extract_transcript.py ./meeting.m4a --platform file --refine
 
-Requires (see requirements.txt): youtube-transcript-api, yt-dlp, optional:
-openai / anthropic / google-generativeai / openai-whisper.
+Requires (see requirements.txt): youtube-transcript-api, yt-dlp, google-genai;
+optional: openai-whisper (fully offline local transcription).
 """
 
 from __future__ import annotations
@@ -195,6 +197,40 @@ def _fetch_youtube_transcript(video_id: str, languages: List[str]) -> Transcript
 
     # New API surface (yt-transcript-api >= 0.6 / 1.x)
     if hasattr(api, "fetch"):
+        # Prefer list() so we can tell manual captions apart from YouTube's
+        # auto-generated ones (the fetched object itself does not always carry
+        # that flag).
+        try:
+            available = api.list(video_id)
+            for language in ordered:
+                if language in tried:
+                    continue
+                tried.append(language)
+                try:
+                    transcript_ref = available.find_transcript([language])
+                    fetched = transcript_ref.fetch()
+                    segments = [
+                        TranscriptSegment(
+                            start=float(getattr(s, "start", 0.0)),
+                            duration=float(getattr(s, "duration", 0.0) or 0.0),
+                            text=_clean_text(getattr(s, "text", "")),
+                        )
+                        for s in fetched
+                    ]
+                    lang = (
+                        getattr(fetched, "language_code", None)
+                        or getattr(transcript_ref, "language_code", None)
+                        or language
+                    )
+                    is_auto = bool(getattr(transcript_ref, "is_generated", False))
+                    return _build_yt_transcript(video_id, lang, segments, is_auto)
+                except Exception as exc:  # noqa: BLE001 - try next language
+                    if "transcript not available" in str(exc).lower():
+                        continue
+                    _log(f"YouTube caption lookup for '{language}' failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - older 1.x without list()
+            _log(f"YouTube transcript list() failed, trying direct fetch: {exc}")
+
         for language in ordered:
             if language in tried:
                 continue
@@ -210,7 +246,8 @@ def _fetch_youtube_transcript(video_id: str, languages: List[str]) -> Transcript
                     for s in fetched
                 ]
                 lang = getattr(fetched, "language_code", None) or language
-                return _build_yt_transcript(video_id, lang, segments, False)
+                is_auto = bool(getattr(fetched, "is_generated", False))
+                return _build_yt_transcript(video_id, lang, segments, is_auto)
             except Exception as exc:  # noqa: BLE001 - try next language
                 if "transcript not available" in str(exc).lower():
                     continue
@@ -412,9 +449,141 @@ def _download_audio_ytdlp(url: str, temp_dir: Path, keep_audio: bool) -> Tuple[P
     return audio_path, title or ""
 
 
+def _gemini_api_key() -> Optional[str]:
+    """Return the Google API key from the environment, if set."""
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
+def gemini_available() -> bool:
+    """True when a Google API key is configured (AI summarization/transcription)."""
+    return bool(_gemini_api_key())
+
+
+def _get_gemini_client():
+    """Create a google-genai client. Raises a helpful error when the SDK is
+    not installed."""
+    try:
+        from google import genai  # type: ignore
+    except ImportError as exc:  # pragma: no cover - import guard
+        raise RuntimeError(
+            "The 'google-genai' package is required for Google AI features. "
+            "Install it with:  pip install google-genai"
+        ) from exc
+    return genai.Client(api_key=_gemini_api_key())
+
+
+def _mime_type(audio_path: Path) -> str:
+    suffix = audio_path.suffix.lower()
+    return {
+        ".mp3": "audio/mp3",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".mp4": "audio/mp4",
+    }.get(suffix, "audio/mp3")
+
+
+def _transcribe_with_gemini(
+    audio_path: Path, language: Optional[str]
+) -> List[TranscriptSegment]:
+    """Transcribe audio/video with Google Gemini (cloud) and return segments
+    with timestamps when the model provides them."""
+    from google.genai import types  # type: ignore
+
+    client = _get_gemini_client()
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    lang_line = f" The spoken language is {language}." if language else ""
+
+    segment_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "segments": types.Schema(
+                type=types.Type.ARRAY,
+                description="Ordered transcript segments with timestamps",
+                items=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "start": types.Schema(
+                            type=types.Type.NUMBER, description="Start time in seconds"
+                        ),
+                        "text": types.Schema(
+                            type=types.Type.STRING, description="Spoken text"
+                        ),
+                    },
+                    required=["start", "text"],
+                ),
+            )
+        },
+        required=["segments"],
+    )
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    def _do_transcribe(use_schema: bool) -> Any:
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "contents": [
+                f"Transcribe the full spoken content of this media file{lang_line} "
+                "Do not add commentary, timestamps in the prose, or any text "
+                "other than the transcription. Provide the complete verbatim "
+                "transcript ordered chronologically.",
+                types.Part.from_bytes(data=audio_bytes, mime_type=_mime_type(audio_path)),
+            ],
+        }
+        if use_schema:
+            kwargs["config"] = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=segment_schema,
+                temperature=0.1,
+            )
+        else:
+            kwargs["config"] = types.GenerateContentConfig(temperature=0.1)
+        return client.models.generate_content(**kwargs)
+
+    try:
+        response = _do_transcribe(True)
+        parsed = _extract_json(getattr(response, "text", "") or "")
+        raw_segments = (parsed or {}).get("segments") if parsed else None
+        if raw_segments:
+            segments = []
+            for item in raw_segments:
+                text = _clean_text(str(item.get("text", "")))
+                if not text:
+                    continue
+                try:
+                    start = float(item.get("start"))
+                except (TypeError, ValueError):
+                    start = None
+                segments.append(TranscriptSegment(start=start, duration=None, text=text))
+            if segments:
+                return segments
+    except Exception as exc:  # noqa: BLE001 - structured output not supported
+        _log(f"Gemini structured transcription failed ({exc}); retrying as plain text.")
+
+    response = _do_transcribe(False)
+    raw_text = getattr(response, "text", "") or ""
+    # Fall back to sentence-length chunks with estimated timestamps.
+    sentences = _split_sentences(raw_text) or [raw_text.strip()]
+    chunks = [s for s in sentences if s]
+    duration = max(len(audio_bytes) / 16000.0, 1.0) if audio_bytes else 0.0
+    per = duration / max(len(chunks), 1) if duration else 3.0
+    return [
+        TranscriptSegment(start=round(i * per, 2), duration=round(per, 2), text=chunk)
+        for i, chunk in enumerate(chunks)
+    ]
+
+
 def _transcribe_audio(audio_path: Path, language: Optional[str], whisper_model: str) -> List[TranscriptSegment]:
-    """Transcribe audio using local openai-whisper if available, otherwise the
-    OpenAI audio transcriptions API (requires OPENAI_API_KEY)."""
+    """Transcribe audio using local openai-whisper if available, otherwise
+    Google Gemini (cloud, requires GEMINI_API_KEY / GOOGLE_API_KEY).
+
+    Only Google models are used for cloud AI; local Whisper is an optional,
+    fully offline open-source engine.
+    """
     try:
         import whisper  # type: ignore
 
@@ -434,37 +603,15 @@ def _transcribe_audio(audio_path: Path, language: Optional[str], whisper_model: 
     except ImportError:
         pass
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    if not gemini_available():
         raise RuntimeError(
             "No caption/subtitle and no transcription engine available. "
-            "Install openai-whisper locally (`pip install openai-whisper`) or set "
-            "OPENAI_API_KEY to use the OpenAI whisper-1 API."
+            "Either install local Whisper (`pip install openai-whisper`, fully "
+            "offline) or set GEMINI_API_KEY to transcribe with Google Gemini."
         )
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The 'openai' package is required for API transcription.") from exc
 
-    _log("Transcribing with OpenAI whisper-1 (API)...")
-    client = OpenAI(api_key=api_key)
-    with open(audio_path, "rb") as file_obj:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=file_obj,
-            language=language,
-            response_format="verbose_json",
-        )
-    segments = []
-    for seg in getattr(response, "segments", []) or []:
-        segments.append(
-            TranscriptSegment(
-                start=float(seg.get("start", 0.0)),
-                duration=float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)),
-                text=_clean_text(seg.get("text", "")),
-            )
-        )
-    return segments
+    _log("Transcribing with Google Gemini (cloud)...")
+    return _transcribe_with_gemini(audio_path, language)
 
 
 def _extract_with_ytdlp(
@@ -700,143 +847,244 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _summarize_openai(text: str, refine: bool, model: Optional[str], language: str) -> Any:
-    from openai import OpenAI
+# ---------------------------------------------------------------------------
+# Google Gemini summarisation (the only cloud AI used by this project)
+# ---------------------------------------------------------------------------
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
-    model = model or "gpt-4o-mini"
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    system = (
-        "You are a professional video summarizer. Produce a concise, factual "
-        f"summary in {language}. Do not invent information that is not present."
-    )
-    if refine:
-        user = textwrap.dedent(
-            f"""
-            Here is a video transcript:
-            <transcript>
-            {text}
-            </transcript>
+# Transcripts larger than this (in characters) are summarised in chunks with a
+# map-reduce pass so very long videos never exceed the model's context window.
+_GEMINI_CHUNK_CHARS = 28000
+_GEMINI_CHUNK_OVERLAP = 600
 
-            Return ONLY a JSON object with this schema:
-            {{
-              "overview": "2-3 sentence paragraph",
-              "summary": "4-8 sentence narrative summary",
-              "key_points": ["point1", "point2"],
-              "highlights": ["memorable quote or sound bite"],
-              "action_items": ["actionable takeaway or next step"]
-            }}
-            """
+
+def _chunk_text(text: str, size: int = _GEMINI_CHUNK_CHARS, overlap: int = _GEMINI_CHUNK_OVERLAP) -> List[str]:
+    """Split text into roughly `size`-char chunks on sentence boundaries."""
+    sentences = _split_sentences(text)
+    if not sentences:
+        return [text] if text.strip() else []
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for sentence in sentences:
+        if current_len + len(sentence) > size and current:
+            chunks.append(" ".join(current))
+            # Carry a little overlap for context continuity.
+            tail = " ".join(current)[-overlap:]
+            current = [tail, sentence]
+            current_len = len(tail) + len(sentence) + 1
+        else:
+            current.append(sentence)
+            current_len += len(sentence) + 1
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _gemini_refined_schema() -> Any:
+    from google.genai import types  # type: ignore
+
+    def _str(desc: str) -> Any:
+        return types.Schema(type=types.Type.STRING, description=desc)
+
+    def _arr(desc: str) -> Any:
+        return types.Schema(
+            type=types.Type.ARRAY,
+            description=desc,
+            items=types.Schema(type=types.Type.STRING),
         )
-    else:
-        user = (
-            f"Summarize the following transcript in {language}.\n\n"
-            f"<transcript>\n{text}\n</transcript>"
-        )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
+
+    return types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "overview": _str("2-3 sentence paragraph overview"),
+            "summary": _str("4-8 sentence narrative summary"),
+            "key_points": _arr("5-8 key takeaways"),
+            "highlights": _arr("Notable quotes or sound bites"),
+            "action_items": _arr("Practical actionable takeaways or next steps"),
+        },
+        required=["overview", "summary", "key_points"],
     )
-    result = response.choices[0].message.content or ""
-    if refine:
-        parsed = _extract_json(result)
-        if parsed:
-            return parsed
-        return {"type": "refined", "summary": result, "overview": result, "key_points": []}
-    return result
 
 
-def _summarize_anthropic(text: str, refine: bool, model: Optional[str], language: str) -> Any:
-    import anthropic
+def _gemini_generate(prompt: str, model: str, response_schema: Any = None) -> str:
+    """Single Gemini generate_content call; retries once without the JSON
+    schema for SDKs/models that reject structured output."""
+    from google.genai import types  # type: ignore
 
-    model = model or "claude-3-5-haiku-latest"
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    system = (
-        "You are a professional video summarizer. Produce a concise, factual "
-        f"summary in {language}. Do not invent information that is not present."
-    )
-    if refine:
-        user = textwrap.dedent(
-            f"""
-            Here is a video transcript:
-            <transcript>
-            {text}
-            </transcript>
+    client = _get_gemini_client()
 
-            Return ONLY a JSON object with this schema:
-            {{
-              "overview": "2-3 sentence paragraph",
-              "summary": "4-8 sentence narrative summary",
-              "key_points": ["point1", "point2"],
-              "highlights": ["memorable quote or sound bite"],
-              "action_items": ["actionable takeaway or next step"]
-            }}
-            """
+    def _call(with_schema: bool) -> str:
+        config_kwargs: Dict[str, Any] = {"temperature": 0.2}
+        if with_schema and response_schema is not None:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(**config_kwargs),
         )
-    else:
-        user = (
-            f"Summarize the following transcript in {language}.\n\n"
-            f"<transcript>\n{text}\n</transcript>"
-        )
-    response = client.messages.create(
-        model=model,
-        max_tokens=1800,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    result = response.content[0].text
-    if refine:
-        parsed = _extract_json(result)
-        if parsed:
-            return parsed
-        return {"type": "refined", "summary": result, "overview": result, "key_points": []}
-    return result
+        return getattr(response, "text", "") or ""
+
+    try:
+        return _call(True)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"Gemini structured call failed ({exc}); retrying without schema.")
+        return _call(False)
 
 
-def _summarize_gemini(text: str, refine: bool, model: Optional[str], language: str) -> Any:
-    import google.generativeai as genai
+def _gemini_summarize_chunk(
+    chunk: str, refine: bool, model: str, language: str
+) -> Any:
+    """Summarise one chunk of transcript.
 
-    model = model or "gemini-1.5-flash"
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    client = genai.GenerativeModel(model)
+    Returns a refined dict when `refine` is set, otherwise a plain string.
+    """
     if refine:
         prompt = textwrap.dedent(
             f"""
-            Summarize the following transcript in {language} and return ONLY JSON:
+            You are a professional video transcript analyst working in {language}.
+            Analyse the transcript chunk below and return ONLY a JSON object:
             {{
-              "overview": "...",
-              "summary": "...",
-              "key_points": ["..."],
-              "highlights": ["..."],
-              "action_items": ["..."]
+              "overview": "2-3 sentence overview of this chunk",
+              "summary": "4-8 sentence factual narrative of this chunk",
+              "key_points": ["important point", "..."],
+              "highlights": ["notable quote or moment", "..."],
+              "action_items": ["actionable takeaway", "..."]
             }}
+            Rules: use only information present in the transcript; do not invent
+            facts; write in {language}; keep lists concise (1-8 items each).
 
-            Transcript:
-            {text}
+            <transcript>
+            {chunk}
+            </transcript>
             """
         )
-    else:
-        prompt = f"Summarize the following transcript in {language}.\n\n{text}"
-    result = client.generate_content(prompt).text
-    if refine:
+        result = _gemini_generate(prompt, model, _gemini_refined_schema())
         parsed = _extract_json(result)
         if parsed:
             return parsed
-        return {"type": "refined", "summary": result, "overview": result, "key_points": []}
-    return result
+        return {"overview": result, "summary": result, "key_points": []}
+
+    prompt = textwrap.dedent(
+        f"""
+        You are a professional video summarizer working in {language}.
+        Summarise the transcript chunk below in 4-8 concise, factual sentences.
+        Use only information present in the transcript; do not invent facts;
+        write in {language}.
+
+        <transcript>
+        {chunk}
+        </transcript>
+        """
+    )
+    return _gemini_generate(prompt, model).strip()
+
+
+def _gemini_reduce(chunk_summaries: List[Any], refine: bool, model: str, language: str) -> Any:
+    """Combine per-chunk summaries into one final summary."""
+    if refine:
+        combined = json.dumps(chunk_summaries, ensure_ascii=False, indent=1)
+        prompt = textwrap.dedent(
+            f"""
+            You are a professional video transcript analyst working in {language}.
+            Below are per-section analyses of a long video, in JSON form. Merge
+            them into ONE final coherent report for the whole video and return
+            ONLY a JSON object:
+            {{
+              "overview": "2-3 sentence overview of the whole video",
+              "summary": "5-10 sentence narrative summary of the whole video",
+              "key_points": ["most important point", "..."],
+              "highlights": ["best quote or moment", "..."],
+              "action_items": ["actionable takeaway", "..."]
+            }}
+            Deduplicate points, keep the most important ones, and use only the
+            information provided. Write everything in {language}.
+
+            <sections>
+            {combined}
+            </sections>
+            """
+        )
+        result = _gemini_generate(prompt, model, _gemini_refined_schema())
+        parsed = _extract_json(result)
+        if parsed:
+            return parsed
+        return {"overview": result, "summary": result, "key_points": []}
+
+    joined = "\n\n".join(f"- {s}" for s in chunk_summaries)
+    prompt = textwrap.dedent(
+        f"""
+        You are a professional video summarizer working in {language}.
+        Below are section summaries of a long video. Merge them into one
+        concise, coherent 5-10 sentence summary of the whole video, using only
+        the information provided. Write in {language}.
+
+        <section-summaries>
+        {joined}
+        </section-summaries>
+        """
+    )
+    return _gemini_generate(prompt, model).strip()
+
+
+def _summarize_gemini(text: str, refine: bool, model: Optional[str], language: str) -> Any:
+    """Summarise with Google Gemini, chunking long transcripts map-reduce
+    style so the model's context window is never exceeded."""
+    model = model or os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    chunks = _chunk_text(text)
+    if len(chunks) == 1:
+        return _gemini_summarize_chunk(chunks[0], refine, model, language)
+
+    _log(f"Long transcript: summarising {len(chunks)} chunks with Gemini then merging.")
+    partial = [_gemini_summarize_chunk(chunk, refine, model, language) for chunk in chunks]
+    return _gemini_reduce(partial, refine, model, language)
+
+
+def _ensure_refined_shape(summary: Dict[str, Any], transcript: "Transcript") -> Dict[str, Any]:
+    """Make sure every refined report has the fields the UI/CLI expect, and
+    fill in stats from the transcript."""
+    def _as_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return []
+
+    refined = {
+        "type": "refined",
+        "title": transcript.title or "Untitled video",
+        "source": transcript.source,
+        "url": transcript.url,
+        "overview": str(summary.get("overview") or summary.get("summary") or "").strip(),
+        "summary": str(summary.get("summary") or summary.get("overview") or "").strip(),
+        "key_points": _as_list(summary.get("key_points")),
+        "highlights": _as_list(summary.get("highlights")),
+        "action_items": _as_list(summary.get("action_items")),
+    }
+    if not refined["overview"]:
+        sentences = _split_sentences(transcript.text)
+        refined["overview"] = sentences[0] if sentences else "No summary available."
+    if not refined["summary"]:
+        refined["summary"] = refined["overview"]
+    if not refined["key_points"]:
+        refined["key_points"] = _split_sentences(transcript.text)[:5] or ["No key points detected."]
+    if not refined["highlights"]:
+        refined["highlights"] = ["No direct quotes detected."]
+    if not refined["action_items"]:
+        refined["action_items"] = ["No explicit action items detected."]
+    refined["stats"] = {
+        "word_count": transcript.word_count,
+        "char_count": len(transcript.text),
+        "estimated_reading_minutes": round(max(transcript.word_count / 200, 0), 1),
+        "language": transcript.language or "unknown",
+    }
+    return refined
 
 
 def _llm_available() -> Optional[str]:
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai"
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    if os.environ.get("GEMINI_API_KEY"):
-        return "gemini"
-    return None
+    # Google Gemini is the only cloud AI provider used by this project.
+    return "gemini" if gemini_available() else None
 
 
 def _summarize_llm(
@@ -850,18 +1098,12 @@ def _summarize_llm(
     if not provider:
         if force:
             raise RuntimeError(
-                "No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, "
-                "or GEMINI_API_KEY and try --summary-mode llm again."
+                "Google Gemini is not configured. Set GEMINI_API_KEY (or "
+                "GOOGLE_API_KEY) and install google-genai (`pip install "
+                "google-genai`), then try --summary-mode llm again."
             )
         return "", "extractive"
-
-    if provider == "openai":
-        return _summarize_openai(text, refine, model, language), "llm"
-    if provider == "anthropic":
-        return _summarize_anthropic(text, refine, model, language), "llm"
-    if provider == "gemini":
-        return _summarize_gemini(text, refine, model, language), "llm"
-    return "", "extractive"
+    return _summarize_gemini(text, refine, model, language), "llm"
 
 
 def summarize_transcript(
@@ -871,24 +1113,42 @@ def summarize_transcript(
     model: Optional[str] = None,
     language: str = "English",
     max_sentences: int = 6,
-) -> Tuple[Any, str]:
-    """Return (summary, method). `method` is 'llm' or 'extractive'."""
+) -> Tuple[Any, str, List[str]]:
+    """Return (summary, method, warnings). `method` is 'llm', 'extractive', or
+    'none'. The LLM is always Google Gemini."""
     text = transcript.text
+    warnings: List[str] = []
     if not text:
-        return "", "none"
+        return "", "none", warnings
 
     if mode in ("auto", "llm"):
-        result, method = _summarize_llm(
-            text, refine=refine, model=model, language=language, force=(mode == "llm")
-        )
+        try:
+            result, method = _summarize_llm(
+                text, refine=refine, model=model, language=language,
+                force=(mode == "llm"),
+            )
+        except RuntimeError:
+            if mode == "llm":
+                raise
+            result, method = "", "extractive"
+        except Exception as exc:  # noqa: BLE001 - never let an API error kill extraction
+            if mode == "llm":
+                raise
+            warnings.append(
+                f"Google Gemini summarization failed ({exc}); fell back to the local extractive summary."
+            )
+            result, method = "", "extractive"
+
         if method == "llm":
-            return result, method
+            if refine and isinstance(result, dict):
+                result = _ensure_refined_shape(result, transcript)
+            return result, method, warnings
 
     # Fallback / explicit extractive path.
     abstract = _extractive_summary(text, max_sentences=max_sentences)
     if refine:
-        return _heuristic_refined_summary(transcript, abstract), "extractive"
-    return abstract, "extractive"
+        return _heuristic_refined_summary(transcript, abstract), "extractive", warnings
+    return abstract, "extractive", warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1135,10 +1395,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not source:
         parser.error("Provide a video URL, YouTube id, or --input file path.")
 
+    # A positional argument that is a local path (not a URL) is treated as a
+    # local input file, matching the documented `./meeting.m4a` usage.
+    url_arg = args.url
+    input_path = args.input
+    if url_arg and not is_url(url_arg) and not extract_youtube_id(url_arg):
+        candidate = Path(url_arg).expanduser()
+        if candidate.exists():
+            input_path = str(candidate)
+            url_arg = None
+
     try:
         transcript = extract_transcript(
-            url=args.url,
-            input_path=args.input,
+            url=url_arg,
+            input_path=input_path,
             platform=args.platform,
             languages=[
                 lang.strip() for lang in args.languages.split(",") if lang.strip()
@@ -1159,7 +1429,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     method = "none"
     if not args.no_summary:
         try:
-            summary, method = summarize_transcript(
+            summary, method, summary_warnings = summarize_transcript(
                 transcript,
                 refine=args.refine,
                 mode=args.summary_mode,
@@ -1167,6 +1437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 language=args.summary_language,
                 max_sentences=args.max_summary_sentences,
             )
+            for warning in summary_warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             print(f"Error generating summary: {exc}", file=sys.stderr)
             return 1
